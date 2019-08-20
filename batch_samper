@@ -1,0 +1,211 @@
+import os
+from pathlib import Path
+
+import cv2
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+
+import time
+
+class VideoDataset(Dataset):
+
+    def __init__(self, directory, mode='train', clip_len=8, frame_sample_rate=1):
+        folder = Path(directory) / mode  # get the directory of the specified split
+        self.clip_len = clip_len
+
+        self.short_side = [200, 250]  # 短边大小
+        self.crop_size = 224  # 裁剪后的尺寸
+        self.frame_sample_rate = frame_sample_rate  # 每隔多少帧取1帧
+        self.mode = mode  # mode
+        self.class_list = None
+        # 设置label:index
+        self.fnames, labels = [], []
+        for label in sorted(os.listdir(folder)):
+            for fname in os.listdir(os.path.join(folder, label)):
+                self.fnames.append(os.path.join(folder, label, fname))
+                labels.append(label)
+        self.class_list = labels
+        # prepare a mapping between the label names (strings) and indices (ints)
+        self.label2index = {label: index for index, label in enumerate(sorted(set(labels)))}
+        # convert the list of label names into an array of label indices
+        self.label_array = np.array([self.label2index[label] for label in self.class_list], dtype=int)
+
+        label_file = str(len(os.listdir(folder))) + 'class_labels.txt'
+        with open(label_file, 'w') as f:
+            for id, label in enumerate(sorted(self.label2index)):
+                f.writelines(str(id + 1) + ' ' + label + '\n')
+
+    def classes_list(self):
+        return self.class_list
+
+    def __getitem__(self, index):
+
+        # loading and preprocessing. TODO move them to transform classes
+        buffer = self.loadvideo(self.fnames[index])
+
+        while buffer.shape[0] < self.clip_len + 2:  # 当butter的帧数不够时，这个视频文件就不要了，重新添加新的视频文件
+            index = np.random.randint(self.__len__())
+            buffer = self.loadvideo(self.fnames[index])
+
+        if self.mode == 'train' or self.mode == 'training':
+            buffer = self.randomflip(buffer)
+        buffer = self.crop(buffer, self.clip_len, self.crop_size)  # 随机取64帧
+        buffer = self.normalize(buffer)
+        buffer = self.to_tensor(buffer)
+        print(index)
+        return buffer, self.class_list[index]
+
+    def to_tensor(self, buffer):
+        # convert from [D, H, W, C] format to [C, D, H, W] (what PyTorch uses)
+        # D = Depth (in this case, time), H = Height, W = Width, C = Channels
+        return buffer.transpose((3, 0, 1, 2))
+
+    def loadvideo(self, fname):
+        remainder = np.random.randint(self.frame_sample_rate)  # 视频帧数保留率 = 1
+        # initialize a VideoCapture object to read video data into a numpy array
+        capture = cv2.VideoCapture(fname)
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))  # 视频总帧数
+        frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))  # 视频w
+        frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))  # h
+
+        # 对短边进行处理，长边按比例放缩 => 改变尺寸
+        if frame_height < frame_width:
+            resize_height = np.random.randint(self.short_side[0], self.short_side[1] + 1)
+            resize_width = int(float(resize_height) / frame_height * frame_width)
+        else:
+            resize_width = np.random.randint(self.short_side[0], self.short_side[1] + 1)
+            resize_height = int(float(resize_width) / frame_width * frame_height)
+
+        # create a buffer. Must have dtype float, so it gets converted to a FloatTensor by Pytorch later
+        # 每个视频最多取300帧
+        start_idx = 0
+        end_idx = frame_count - 1
+        frame_count_sample = frame_count // self.frame_sample_rate - 1
+        if frame_count > 300:
+            end_idx = np.random.randint(300, frame_count)
+            start_idx = end_idx - 300
+            frame_count_sample = 301 // self.frame_sample_rate - 1
+        buffer = np.empty((frame_count_sample, resize_height, resize_width, 3), np.dtype('float32'))
+
+        count = 0
+        retaining = True
+        sample_count = 0
+
+        # read in each frame, one at a time into the numpy buffer array
+        while (count <= end_idx and retaining):
+            retaining, frame = capture.read()
+            if count < start_idx:
+                count += 1
+                continue
+            if retaining is False or count > end_idx:
+                break
+            if count % self.frame_sample_rate == remainder and sample_count < frame_count_sample:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # will resize frames if not already final size
+
+                if (frame_height != resize_height) or (frame_width != resize_width):
+                    frame = cv2.resize(frame, (resize_width, resize_height))
+                buffer[sample_count] = frame
+                sample_count = sample_count + 1
+            count += 1
+        capture.release()
+        return buffer
+
+    def crop(self, buffer, clip_len, crop_size):
+        # randomly select time index for temporal jittering
+        time_index = np.random.randint(buffer.shape[0] - clip_len)
+        # Randomly select start indices in order to crop the video
+        height_index = np.random.randint(buffer.shape[1] - crop_size)
+        width_index = np.random.randint(buffer.shape[2] - crop_size)
+
+        # crop and jitter the video using indexing. The spatial crop is performed on
+        # the entire array, so each frame is cropped in the same location. The temporal
+        # jitter takes place via the selection of consecutive frames
+        buffer = buffer[time_index:time_index + clip_len,
+                 height_index:height_index + crop_size,
+                 width_index:width_index + crop_size, :]
+
+        return buffer
+
+    def normalize(self, buffer):
+        # Normalize the buffer
+        # buffer = (buffer - 128)/128.0
+        for i, frame in enumerate(buffer):
+            frame = (frame - np.array([[[128.0, 128.0, 128.0]]])) / 128.0
+            buffer[i] = frame
+        return buffer
+
+    def randomflip(self, buffer):
+        """Horizontally flip the given image and ground truth randomly with a probability of 0.5."""
+        if np.random.random() < 0.5:
+            for i, frame in enumerate(buffer):
+                buffer[i] = cv2.flip(frame, flipCode=1)
+        return buffer
+
+    def __len__(self):
+        return len(self.fnames)
+
+
+class batch_sampler():
+    def __init__(self, batch_size, class_list):
+        self.batch_size = batch_size
+        self.class_list = class_list
+        self.unique_value = np.unique(class_list)
+        self.iter_list = []
+
+        print("self.unique_value", len(self.unique_value))
+        for v in self.unique_value:
+            # find the class index in the total class_list
+            indexes = [i for i, x in enumerate(self.class_list) if x == v]
+            self.iter_list.append(self.shuffle_iterator(indexes))
+        self.len = len(class_list) // batch_size
+
+
+    def __iter__(self):
+        index_list = []
+
+        for _ in range(self.len):
+            a = []
+            b = []
+            for index in range(self.batch_size):
+                t = next(self.iter_list[index % len(self.unique_value)])
+                a.append(self.class_list[t])
+                b.append(t)
+
+                index_list.append(t)
+            # print(a)
+            # print(b)
+            np.random.shuffle(index_list)
+            # print(index_list)
+            print(index_list)
+            yield index_list
+            index_list = []
+
+    def __len__(self):
+        return self.len
+
+    @staticmethod
+    def shuffle_iterator(iterator):
+        import random
+        # iterator should have limited size
+        index = list(iterator)
+        total_size = len(index)
+        i = 0
+        random.shuffle(index)
+        while True:
+            yield index[i]
+            i += 1
+            if i >= total_size:
+                i = 0
+                random.shuffle(index)
+
+if __name__ == '__main__':
+
+    datapath = '/data/Image_data/hqc_video'
+    dataset = VideoDataset(datapath, mode='train', clip_len=10, frame_sample_rate=1)
+    train_dataloader = DataLoader(dataset, batch_sampler=batch_sampler(batch_size=16, \
+                                    class_list=dataset.classes_list()), num_workers=1)
+    end = time.time()
+    for step, (buffer, label) in enumerate(train_dataloader):
+        # print(sorted(label)) # sorted(label.numpy())
+        end = time.time()
